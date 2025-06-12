@@ -1,0 +1,199 @@
+import json
+import requests
+from pymongo import MongoClient
+
+# MongoDB setup
+def get_mongo_client():
+    return MongoClient(
+        host="notify.pesuacademy.com",
+        port=27017,
+        username="admin",
+        password="",
+        authSource="admin"
+    )
+
+# OpenAI setup
+OPENAI_API_KEY = ""
+OPENAI_MODEL = "gpt-4o"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+SYSTEM_PROMPT = """ATS Resume Evaluation Prompt
+You are an expert ATS (Applicant Tracking System) assistant skilled at evaluating resumes for a given job description. Your task is to evaluate each resume against the job description independently and assign an aiScore from 0 to 100, representing how well the resume aligns with the JD.
+
+For each resume evaluation, assess these key parameters:
+
+Skills match (weighted 30%)
+Required skills (20%): How many required skills appear in the resume?
+Preferred skills (10%): How many preferred skills appear in the resume?
+Experience relevance (weighted 25%)
+Relevance of previous roles to the position (15%)
+Years of experience in similar roles (10%)
+Compensation fit (weighted 15%)
+First prioritize skills and experience match
+For qualified candidates, evaluate expected CTC vs. budget using sliding scale:
+Within budget: Full points
+0-10% above budget: Slight reduction
+10-20% above budget: Moderate reduction
+20% above budget: Larger reduction
+
+Flag highly qualified candidates (85%+ on skills/experience) as "High-Value Talent" even if above budget
+Location compatibility (weighted 15%)
+Exact location match (15%)
+Relocation willingness if location doesn't match (7%)
+Remote work compatibility if applicable (10%)
+Education fit (weighted 10%)
+Required degrees/certifications present
+Relevant field of study
+Availability & notice period (weighted 5%)
+Match between candidate's availability and position's start date requirement
+You must give a score to every resume individually, not in comparison to others. Each candidate is different. When calculating the final aiScore, round to the nearest whole number.
+
+Output format must be a JSON object with a key named 'result' which holds a list of resume objects, like this:
+
+{
+  "result": [
+    {
+      "resumeId": "RES123",
+      "aiScore": 87,
+      "keyMatchPoints": ["Top 3 strongest qualification matches"],
+      "compensationFit": "Within budget/Above budget by X%/Below budget by X%",
+      "locationStatus": "Match/Remote possible/Relocation required",
+      "availabilityMatch": "Immediate/X weeks notice period",
+      "hiringRecommendation": "Strong match within budget/Exceptional talent above budget - consider negotiation/Budget match but minimum qualifications"
+    }
+  ]
+}
+
+If any critical information is missing from either the job description or resume, note this in the evaluation as Null and score based on available information. Do not mix up the details between resumes and keep strictly as Null for missing info."""
+
+def lambda_handler(event, context):
+    mongo_client = get_mongo_client()
+    try:
+        request_data = json.loads(event['body'])
+        resume_id = request_data.get("resumeId")
+        job_id = request_data.get("jobId")
+
+        if not resume_id or not job_id:
+            return {"statusCode": 400, "body": json.dumps({"error": "Missing resumeId or jobId"})}
+
+        db = mongo_client["resumes_database"]
+        resumes_collection = db["resumes"]
+        resume_text_collection = db["resume_text"]
+        jd_collection = db["job_description"]
+        matches_collection = db["matches"]
+
+        # Check if aiScore exists
+        match_doc = matches_collection.find_one(
+            {"jobId": job_id, "matches.resumeId": resume_id},
+            {"matches.$": 1}
+        )
+
+        if match_doc and "matches" in match_doc and match_doc["matches"]:
+            match = match_doc["matches"][0]
+            if "aiScore" in match:
+                print({
+                    "source": "fetched",
+                    "resumeId": resume_id,
+                    "jobId": job_id,
+                    "aiScore": match["aiScore"]
+                })
+                return {
+                    "statusCode": 200,
+                    "body": json.dumps({"aiScore": match["aiScore"]})
+                }
+
+        # Fetch JD text
+        jd = jd_collection.find_one({"jobId": job_id}, {"_id": 0})
+        if not jd:
+            return {"statusCode": 404, "body": json.dumps({"error": "Job description not found"})}
+        jd_text = jd.get("jobDescription", "")
+
+        # Fetch resume data
+        resume = resumes_collection.find_one({"resumeId": resume_id}, {"_id": 0, "embedding": 0})
+        if not resume:
+            return {"statusCode": 404, "body": json.dumps({"error": "Resume not found"})}
+
+        resume_text_doc = resume_text_collection.find_one({"resumeId": resume_id}, {"_id": 0})
+        if resume_text_doc and resume_text_doc.get("resumeText"):
+            formatted_resume = f'### Resume ID: {resume_id} ###\n"""\n{resume_text_doc["resumeText"]}\n"""'
+        else:
+            formatted_resume = json.dumps(resume, indent=2)
+
+        # Prepare user prompt
+        user_prompt = f"""Here is the job description:
+\"\"\"{jd_text}\"\"\"
+
+Here is the resume:
+{formatted_resume}
+
+Evaluate this resume individually and return only JSON in the exact format described above.
+"""
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+
+        payload = {
+            "model": OPENAI_MODEL,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ]
+        }
+
+        response = requests.post(OPENAI_URL, headers=headers, json=payload)
+        response.raise_for_status()
+
+        response_json = response.json()
+        content = response_json["choices"][0]["message"]["content"]
+
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict) or "result" not in parsed:
+            return {"statusCode": 500, "body": json.dumps({"error": "Invalid OpenAI response format"})}
+
+        result_list = parsed["result"]
+        if not isinstance(result_list, list) or not result_list:
+            return {"statusCode": 500, "body": json.dumps({"error": "Empty result list from OpenAI"})}
+
+        result_item = result_list[0]
+        ai_score = result_item.get("aiScore")
+
+        # Decide if we can store back - now storing all new fields
+        stored = False
+        if match_doc and "matches" in match_doc and match_doc["matches"]:
+            update_fields = {
+                "matches.$.aiScore": ai_score,
+                "matches.$.keyMatchPoints": result_item.get("keyMatchPoints"),
+                "matches.$.compensationFit": result_item.get("compensationFit"),
+                "matches.$.locationStatus": result_item.get("locationStatus"),
+                "matches.$.availabilityMatch": result_item.get("availabilityMatch"),
+                "matches.$.hiringRecommendation": result_item.get("hiringRecommendation")
+            }
+            matches_collection.update_one(
+                {"jobId": job_id, "matches.resumeId": resume_id},
+                {"$set": update_fields}
+            )
+            stored = True
+
+        # Print full details
+        print({
+            "source": "generated",
+            "resumeId": resume_id,
+            "jobId": job_id,
+            "stored": stored,
+            "aiScore": ai_score
+        })
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"aiScore": ai_score})
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"statusCode": 500, "body": json.dumps({"error": f"Internal server error: {str(e)}"})}
+    finally:
+        mongo_client.close()
